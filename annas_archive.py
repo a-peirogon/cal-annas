@@ -823,104 +823,22 @@ class AnnasArchiveStore(StorePlugin):
             d.exec()
 
     def get_details(self, search_result: SearchResult, timeout: int = 15):
-        """Populate *search_result.downloads* by scraping the detail page."""
+        """
+        Populate search_result.downloads immediately — no HTTP requests here.
+        The slow_download URL is added directly so the button appears at once.
+        Resolution to the real server URL happens inside create_browser() when
+        the user actually clicks the download button.
+        """
         if not search_result.detail_item:
-            logger.warning('No detail_item provided for get_details')
             return
 
-        timeout = (self.config or {}).get('timeout', timeout)
-        logger.info('Getting details for: %s', search_result.title)
-
-        link_opts = (self.config or {}).get('link', {})
-        url_extension = link_opts.get('url_extension', True)
-        content_type = link_opts.get('content_type', False)
-
-        br = browser()
-        br.addheaders = _BROWSER_HEADERS
-
+        fmt = (search_result.formats or 'epub').lower()
         selected_mirror = self.working_mirror or (self.config or {}).get('mirrors', DEFAULT_MIRRORS)[0]
 
-        try:
-            with closing(br.open(self._get_url(search_result.detail_item), timeout=timeout)) as f:
-                doc = html.fromstring(f.read())
-        except Exception as exc:
-            logger.error('Error fetching details page: %s', exc)
-            return
-
-        download_selectors = [
-            '//div[@id="md5-panel-downloads"]//a[contains(@class,"js-download-link")]',
-            '//a[contains(@class,"js-download-link")]',
-            '//a[starts-with(@href,"http") and ('
-            'contains(@href,"libgen") or contains(@href,"zlibrary") or '
-            'contains(@href,"z-lib") or contains(@href,"sci-hub"))]',
-        ]
-
-        links = []
-        for selector in download_selectors:
-            try:
-                links = doc.xpath(selector)
-                if links:
-                    logger.debug('Found %d download links via selector: %s', len(links), selector)
-                    break
-            except Exception as exc:
-                logger.debug('Error with selector %s: %s', selector, exc)
-
-        fmt = search_result.formats
-
-        # Build the slow_download URL and try to resolve the real download link from it
+        # Add slow_download instantly — no HTTP needed to build this URL
         slow_url = f'{selected_mirror}/slow_download/{search_result.detail_item}/0/0'
-        slow_fmt = (fmt or 'epub').lower()
-        real_slow_url = self._resolve_download_page(slow_url, br, timeout)
-        if real_slow_url:
-            # Infer format from resolved URL if not known
-            if not fmt:
-                for ext in COMMON_FORMATS:
-                    if f'.{ext.lower()}' in real_slow_url.lower():
-                        slow_fmt = ext.lower()
-                        break
-            search_result.downloads[f"Anna\'s Archive (slow).{slow_fmt}"] = real_slow_url
-            logger.debug('Resolved slow_download -> %s', real_slow_url)
-        else:
-            logger.debug('slow_download 403 for %s — skipping', search_result.detail_item)
-
-        # Also add any direct external links found on the md5 page
-        for link in links:
-            url = link.get('href')
-            if not url:
-                continue
-            # Skip slow/fast download — already handled above
-            if '/slow_download/' in url or '/fast_download/' in url:
-                continue
-
-            link_text = ''.join(link.itertext()).strip()
-            if not url.startswith('http'):
-                url = urljoin(selected_mirror, url)
-
-            original_url = url
-            try:
-                url = self._process_download_url(url, link_text, br)
-            except Exception as exc:
-                logger.warning('Error processing URL %s: %s', original_url, exc)
-                continue
-            if not url or not url.startswith('http'):
-                continue
-            if not self._validate_download_url(url, search_result, content_type, url_extension, timeout):
-                continue
-
-            if not fmt:
-                for ext in COMMON_FORMATS:
-                    if f'.{ext.lower()}' in url.lower():
-                        fmt = ext
-                        break
-            if not fmt:
-                continue
-
-            source = link_text if link_text else 'Download'
-            label = f'{source}.{fmt.lower()}'
-            search_result.downloads[label] = url
-            logger.debug('Added download: %s -> %s', label, url)
-
-        logger.info('Found %d download links', len(search_result.downloads))
+        search_result.downloads[f"Anna's Archive (slow).{fmt}"] = slow_url
+        logger.debug('Added instant slow_download link: %s', slow_url)
 
     def _resolve_download_page(self, url: str, br, timeout: int) -> Optional[str]:
         """
@@ -1044,6 +962,34 @@ class AnnasArchiveStore(StorePlugin):
         except Exception as exc:
             logger.debug('Error getting Z-Library link: %s', exc)
         return ''
+
+    def create_browser(self):
+        """
+        Return a browser that intercepts /slow_download/ URLs and resolves them
+        to the real server URL before Calibre attempts the download.
+        This is called by Calibre just before downloading a file.
+        """
+        br = browser()
+        br.addheaders = _BROWSER_HEADERS
+        plugin_self = self
+
+        # Wrap open() to intercept slow_download URLs
+        original_open = br.open
+
+        def intercepting_open(url_or_req, *args, **kwargs):
+            url = url_or_req if isinstance(url_or_req, str) else url_or_req.get_full_url()
+            if '/slow_download/' in url:
+                logger.info('Intercepting slow_download: %s', url)
+                real_url = plugin_self._resolve_download_page(url, br, timeout=30)
+                if real_url:
+                    logger.info('Resolved to: %s', real_url)
+                    return original_open(real_url, *args, **kwargs)
+                else:
+                    logger.warning('Could not resolve slow_download URL: %s', url)
+            return original_open(url_or_req, *args, **kwargs)
+
+        br.open = intercepting_open
+        return br
 
     # ------------------------------------------------------------------
     # ConfigWidget integration
