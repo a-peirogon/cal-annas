@@ -19,8 +19,6 @@ Browse and download millions of books, papers, and magazines directly from Calib
 
 Open the store via **Store > Search stores** or the store icon in the toolbar. Search by title, author, or keyword. Use the filters in **Configure** to narrow by language, filetype, source, etc.
 
-Click the green arrow on any result to download directly to your library.
-
 ---
 
 ### Search filters
