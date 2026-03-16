@@ -3,7 +3,7 @@ from calibre.customize import StoreBase
 
 class AnnasArchiveStore(StoreBase):
     name                    = "Anna's Archive"
-    description             = "The world's largest open-source open-data library."
+    description             = "Search and download books from Anna's Archive — indexes Libgen, Z-Library, Sci-Hub, Internet Archive, and more."
     supported_platforms     = ['windows', 'osx', 'linux']
     author                  = 'a-peirogon'
     version                 = (0, 3, 0)

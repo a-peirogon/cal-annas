@@ -1,19 +1,24 @@
 """
 Anna's Archive Store Plugin for Calibre.
 
-Improvements over previous version:
-  - Real HTTP health-check with TTL cache (not just DNS resolution)
-  - Automatic mirror discovery from annas-archive.org
-  - Mid-search mirror failover when a mirror dies mid-pagination
-  - Last working mirror persisted to config across restarts
+Searches and downloads books from Anna's Archive — the world's largest
+open-source library aggregator, indexing Libgen, Z-Library, Sci-Hub,
+Internet Archive, and more.
+
+Features:
+  - Multi-mirror support (.gl, .pk, .gd) with automatic health-check and
+    failover mid-search
+  - Cloudflare bypass via full browser headers (no Accept-Encoding compression)
+  - Instant download buttons — get_details() is non-blocking; slow_download
+    resolution happens at download time via a custom browser interceptor
+  - Local Qt-generated cover thumbnails (title + author + background color
+    extracted from the page) — no external image requests needed
+  - Paginated search with Referer header for pages 2+
   - Direct URL routing for ISBN-10/13 and MD5 queries
-  - Session-level search result cache (avoids duplicate HTTP round-trips)
-  - File-size extraction alongside format
-  - More robust result-div XPath (based on md5 links, not fragile Tailwind classes)
-  - Format extraction restricted to short badge/chip elements first
-  - Fixed _get_libgen_link / _get_zlib_link to use urlparse instead of split
-  - i18n option labels via _() in constants.py
-  - Configurable max_pages and timeout (saved/loaded through ConfigWidget)
+  - Session-level search result cache to avoid duplicate HTTP round-trips
+  - File size annotated in result titles (e.g. "[3.2 MB]")
+  - Configurable mirrors, max pages, and timeout via the plugin settings UI
+  - Mirror health test button with per-mirror latency display
 """
 
 from contextlib import closing
@@ -824,32 +829,37 @@ class AnnasArchiveStore(StorePlugin):
 
     def get_details(self, search_result: SearchResult, timeout: int = 15):
         """
-        Populate search_result.downloads immediately — no HTTP requests here.
-        The slow_download URL is added directly so the button appears at once.
-        Resolution to the real server URL happens inside create_browser() when
-        the user actually clicks the download button.
+        Returns immediately with a slow_download placeholder — no HTTP requests.
+        The download button appears instantly for every result.
+        All resolution (direct links + slow_download fallback) happens in
+        create_browser() when the user actually clicks the button.
         """
         if not search_result.detail_item:
             return
 
         fmt = (search_result.formats or 'epub').lower()
         selected_mirror = self.working_mirror or (self.config or {}).get('mirrors', DEFAULT_MIRRORS)[0]
-
-        # Add slow_download instantly — no HTTP needed to build this URL
         slow_url = f'{selected_mirror}/slow_download/{search_result.detail_item}/0/0'
-        search_result.downloads[f"Anna's Archive (slow).{fmt}"] = slow_url
-        logger.debug('Added instant slow_download link: %s', slow_url)
+        search_result.downloads[f"Anna's Archive.{fmt}"] = slow_url
 
     def _resolve_download_page(self, url: str, br, timeout: int) -> Optional[str]:
         """
-        Visit a /slow_download/ or /fast_download/ page and return the real
-        "Download now" link found on it, or None if not found.
+        Visit a /slow_download/ page and return the real download URL.
+        First warms up DDoS-Guard cookies by visiting the mirror homepage.
         """
         try:
+            # Warm up DDoS-Guard cookies by visiting the mirror root first
+            mirror_root = '/'.join(url.split('/')[:3])
+            try:
+                with closing(br.open(mirror_root + '/', timeout=timeout)):
+                    pass
+                logger.debug('Cookie warm-up done for %s', mirror_root)
+            except Exception:
+                pass  # If homepage fails, still try the download page
+
             with closing(br.open(url, timeout=timeout)) as resp:
                 raw = resp.read()
             doc = html.fromstring(raw)
-            # Primary: "📚 Download now" anchor
             for xpath in [
                 '//a[contains(text(),"Download now")]/@href',
                 '//a[contains(text(),"download now")]/@href',
@@ -857,11 +867,9 @@ class AnnasArchiveStore(StorePlugin):
                 '//a[contains(@href,"b4mcx") or contains(@href,".net/d")]/@href',
             ]:
                 hrefs = doc.xpath(xpath)
-                if hrefs:
-                    href = hrefs[0]
-                    if href.startswith('http'):
-                        logger.debug('Resolved download page %s -> %s', url, href)
-                        return href
+                if hrefs and hrefs[0].startswith('http'):
+                    logger.debug('Resolved %s -> %s', url, hrefs[0])
+                    return hrefs[0]
         except Exception as exc:
             logger.warning('Failed to resolve download page %s: %s', url, exc)
         return None
@@ -965,28 +973,83 @@ class AnnasArchiveStore(StorePlugin):
 
     def create_browser(self):
         """
-        Return a browser that intercepts /slow_download/ URLs and resolves them
-        to the real server URL before Calibre attempts the download.
-        This is called by Calibre just before downloading a file.
+        Called by Calibre just before downloading. Intercepts slow_download URLs:
+          1. Warm up DDoS-Guard cookies ONCE
+          2. Fetch /md5/ page ONCE, try Libgen.li / Libgen.rs / Sci-Hub direct links
+          3. If none work, try slow_download on each mirror inline (no repeated warm-up)
         """
         br = browser()
         br.addheaders = _BROWSER_HEADERS
         plugin_self = self
-
-        # Wrap open() to intercept slow_download URLs
         original_open = br.open
 
         def intercepting_open(url_or_req, *args, **kwargs):
             url = url_or_req if isinstance(url_or_req, str) else url_or_req.get_full_url()
-            if '/slow_download/' in url:
-                logger.info('Intercepting slow_download: %s', url)
-                real_url = plugin_self._resolve_download_page(url, br, timeout=30)
-                if real_url:
-                    logger.info('Resolved to: %s', real_url)
-                    return original_open(real_url, *args, **kwargs)
-                else:
-                    logger.warning('Could not resolve slow_download URL: %s', url)
-            return original_open(url_or_req, *args, **kwargs)
+            if '/slow_download/' not in url:
+                return original_open(url_or_req, *args, **kwargs)
+
+            logger.info('Resolving download at click time: %s', url)
+
+            try:
+                md5 = url.split('/slow_download/')[1].split('/')[0]
+            except IndexError:
+                return original_open(url_or_req, *args, **kwargs)
+
+            mirrors = list((plugin_self.config or {}).get('mirrors', DEFAULT_MIRRORS))
+            if plugin_self.working_mirror:
+                mirrors = [plugin_self.working_mirror] + [m for m in mirrors if m != plugin_self.working_mirror]
+            selected_mirror = mirrors[0]
+
+            # Warm up DDoS-Guard cookies ONCE
+            try:
+                with closing(br.open(f'{selected_mirror}/', timeout=10)):
+                    pass
+            except Exception:
+                pass
+
+            # --- Step 1: fetch /md5/ ONCE, try Libgen/Sci-Hub only (skip z-lib) ---
+            try:
+                with closing(br.open(f'{selected_mirror}/md5/{md5}', timeout=20)) as f:
+                    doc = html.fromstring(f.read())
+                for link in doc.xpath(
+                    '//a[starts-with(@href,"http") and ('
+                    'contains(@href,"libgen.li") or contains(@href,"libgen.rs") or '
+                    'contains(@href,"sci-hub"))]'
+                ):
+                    direct_url = link.get('href', '')
+                    link_text = ''.join(link.itertext()).strip()
+                    try:
+                        direct_url = plugin_self._process_download_url(direct_url, link_text, br)
+                    except Exception as exc:
+                        logger.debug('Direct link failed: %s', exc)
+                        continue
+                    if direct_url and direct_url.startswith('http'):
+                        logger.info('Using direct link: %s', direct_url)
+                        return original_open(direct_url, *args, **kwargs)
+            except Exception as exc:
+                logger.warning('md5 page fetch failed: %s', exc)
+
+            # --- Step 2: try slow_download on each mirror directly (no _resolve helper) ---
+            for mirror in mirrors:
+                try:
+                    with closing(br.open(f'{mirror}/slow_download/{md5}/0/0', timeout=25)) as resp:
+                        raw = resp.read()
+                    doc2 = html.fromstring(raw)
+                    for xpath in [
+                        '//a[contains(text(),"Download now")]/@href',
+                        '//a[contains(@href,"b4mcx") or contains(@href,".net/d")]/@href',
+                    ]:
+                        hrefs = doc2.xpath(xpath)
+                        if hrefs and hrefs[0].startswith('http'):
+                            logger.info('Resolved via %s -> %s', mirror, hrefs[0])
+                            return original_open(hrefs[0], *args, **kwargs)
+                except Exception as exc:
+                    logger.warning('slow_download failed on %s: %s', mirror, exc)
+
+            raise Exception(
+                'No se pudo descargar: todos los links fallaron.\n'
+                'Intenta de nuevo en unos segundos o usa "Abrir en navegador externo".'
+            )
 
         br.open = intercepting_open
         return br
