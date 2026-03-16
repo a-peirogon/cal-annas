@@ -395,8 +395,29 @@ class AnnasArchiveStore(StorePlugin):
             logger.debug('Error extracting format: %s', exc)
         return None
 
-    # Regex to parse rgb() color from the fallback cover style attribute
-    _RGB_RE = re.compile(r'rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)')
+    # Pre-compiled ISBN regex — matches ISBN-13 (978/979) and ISBN-10
+    _ISBN_COVER_RE = re.compile(r'\b(97[89]\d{10}|\d{9}[\dXx])\b')
+
+    @staticmethod
+    def _extract_isbn(result_div) -> Optional[str]:
+        """
+        Extract the first ISBN-13 or ISBN-10 found in the result div.
+        Prefers ISBN-13 (97x prefixed). Looks in the full text content
+        which includes the filename line where ISBNs reliably appear.
+        """
+        try:
+            text = ' '.join(result_div.xpath('.//text()'))
+            # Prefer ISBN-13
+            isbn13 = re.findall(r'\b97[89]\d{10}\b', text)
+            if isbn13:
+                return isbn13[0]
+            # Fall back to ISBN-10
+            isbn10 = re.findall(r'\b\d{9}[\dXx]\b', text)
+            if isbn10:
+                return isbn10[0]
+        except Exception as exc:
+            logger.debug('Error extracting ISBN: %s', exc)
+        return None
 
     @staticmethod
     def _generate_cover(title: str, author: str, bg_rgb: tuple) -> Optional[str]:
@@ -455,39 +476,122 @@ class AnnasArchiveStore(StorePlugin):
             logger.debug('Cover generation failed: %s', exc)
         return None
 
+    # Regex to parse rgb() color from the fallback cover style attribute
+    _RGB_RE = re.compile(r'rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)')
+
+    # Curated palette — distinct background colors with matching title/author text colors
+    _COVER_PALETTE = [
+        ((214, 234, 248), (21,  67, 96),  (101, 60,  0  )),  # blue
+        ((212, 239, 223), (20,  90, 50),  (101, 60,  0  )),  # green
+        ((253, 235, 208), (120, 66,  18), (76,  29,  149)),  # amber
+        ((242, 215, 213), (120, 30,  20), (76,  29,  149)),  # red
+        ((235, 222, 237), (76,  29,  149),(120, 53,  15 )),  # violet
+        ((208, 236, 231), (20,  80,  70), (101, 60,  0  )),  # teal
+        ((252, 228, 236), (131, 20,  75), (76,  29,  149)),  # pink
+        ((255, 243, 205), (133, 100,  4), (76,  29,  149)),  # yellow
+        ((225, 215, 252), (55,  20,  150),(120, 53,  15 )),  # indigo
+        ((209, 231, 221), (25,  80,  55), (131, 20,  75 )),  # sage
+        ((252, 215, 173), (140, 70,  10), (76,  29,  149)),  # orange
+        ((210, 224, 252), (30,  60,  160),(120, 53,  15 )),  # periwinkle
+    ]
+
+    @staticmethod
+    def _generate_cover_data_uri(title: str, author: str,
+                                  bg: tuple, title_color: tuple,
+                                  author_color: tuple) -> Optional[str]:
+        """
+        Render a cover with Qt and return it as a data: URI (base64 PNG).
+        data: URIs work in Calibre's store panel without any HTTP request.
+        """
+        try:
+            try:
+                from qt.core import QImage, QPainter, QColor, QFont, QRect, Qt, QBuffer, QIODevice
+            except ImportError:
+                from PyQt5.QtGui import QImage, QPainter, QColor, QFont
+                from PyQt5.QtCore import QRect, Qt, QBuffer, QIODevice
+
+            import base64
+            W, H = 96, 144
+
+            img = QImage(W, H, QImage.Format.Format_RGB32)
+            img.fill(QColor(*bg))
+
+            p = QPainter(img)
+            p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+            # Title
+            p.setPen(QColor(*title_color))
+            f = QFont('sans-serif')
+            f.setPixelSize(9)
+            f.setBold(True)
+            p.setFont(f)
+            p.drawText(QRect(5, 5, W - 10, H - 35),
+                       Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignTop,
+                       title)
+
+            # Separator line
+            p.setPen(QColor(*title_color))
+            p.drawLine(5, H - 33, W - 5, H - 33)
+
+            # Author
+            p.setPen(QColor(*author_color))
+            f2 = QFont('sans-serif')
+            f2.setPixelSize(7)
+            f2.setItalic(True)
+            p.setFont(f2)
+            p.drawText(QRect(5, H - 30, W - 10, 28),
+                       Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignTop,
+                       author)
+            p.end()
+
+            # Encode to data URI
+            try:
+                qbuf = QBuffer()
+                qbuf.open(QIODevice.OpenModeFlag.WriteOnly)
+                img.save(qbuf, 'PNG')
+                buf = bytes(qbuf.data())
+                qbuf.close()
+            except Exception:
+                import tempfile
+                tmp = tempfile.mktemp(suffix='.png')
+                img.save(tmp, 'PNG')
+                with open(tmp, 'rb') as fh:
+                    buf = fh.read()
+
+            if buf:
+                return f'data:image/png;base64,{base64.b64encode(buf).decode()}'
+        except Exception as exc:
+            logger.debug('Cover data URI generation failed: %s', exc)
+        return None
+
     def _extract_cover_url(self, result_div, title: str = '',
                            author: str = '', base_mirror: str = '') -> Optional[str]:
         """
-        Try three strategies in order:
-        1. Generate a cover locally from the fallback-cover div (instant, no HTTP)
-        2. Use the <img> src if it's an absolute URL
-        3. Prefix a relative src with the mirror base
+        Cover URL resolution:
+        1. Google Books by ISBN (real cover when ISBN available)
+        2. Qt data URI — color picked from palette by title hash (instant, always works)
         """
-        # Strategy 1: local Qt-generated cover from fallback div data
+        # Strategy 1: Google Books by ISBN
         try:
-            fallback = result_div.xpath(
-                './/div[contains(@class,"js-aarecord-list-fallback-cover")]'
-            )
-            if fallback:
-                style = fallback[0].get('style', '')
-                m = self._RGB_RE.search(style)
-                bg = (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (220, 210, 230)
-                cover = self._generate_cover(title, author, bg)
-                if cover:
-                    return cover
+            isbn = self._extract_isbn(result_div)
+            if isbn:
+                return (
+                    f'https://books.google.com/books/content'
+                    f'?vid=ISBN:{isbn}&printsec=frontcover&img=1&zoom=1'
+                )
         except Exception as exc:
-            logger.debug('Local cover generation failed: %s', exc)
+            logger.debug('Google Books ISBN cover failed: %s', exc)
 
-        # Strategy 2 & 3: remote image from <img> src
+        # Strategy 2: Qt data URI with palette color by title hash
         try:
-            imgs = result_div.xpath('.//img/@src')
-            if imgs:
-                src = imgs[0]
-                if src.startswith('http'):
-                    return src
-                return f'{base_mirror}{src}' if base_mirror else src
+            idx = hash(title or author or 'x') % len(self._COVER_PALETTE)
+            bg, tc, ac = self._COVER_PALETTE[idx]
+            data_uri = self._generate_cover_data_uri(title, author, bg, tc, ac)
+            if data_uri:
+                return data_uri
         except Exception as exc:
-            logger.debug('Error extracting cover URL: %s', exc)
+            logger.debug('Qt data URI cover failed: %s', exc)
+
         return None
 
     @staticmethod
@@ -718,6 +822,13 @@ class AnnasArchiveStore(StorePlugin):
             try:
                 with closing(br.open(url, timeout=timeout)) as resp:
                     raw = resp.read()
+                    # Temp debug: dump first page HTML once
+                    if page == 1:
+                        try:
+                            with open('/tmp/aa_calibre_p1.html', 'wb') as _f:
+                                _f.write(raw)
+                        except Exception:
+                            pass
                     if resp.code != 200:
                         snippet = raw[:300].decode('utf-8', errors='replace')
                         logger.warning(
