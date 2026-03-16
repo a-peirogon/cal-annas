@@ -778,9 +778,10 @@ class AnnasArchiveStore(StorePlugin):
 
             logger.info('Page %d: %d results (%d total)', page, page_count, results_count)
             page += 1
-            # Small delay between pages to avoid Cloudflare rate-limiting
+            # Cloudflare rate-limits rapid consecutive page fetches.
+            # Use a longer delay from page 3 onwards.
             if results_count < max_results and page <= max_pages:
-                time.sleep(0.5)
+                time.sleep(2.0 if page >= 3 else 0.5)
 
         logger.info('Search complete: %d results', results_count)
 
