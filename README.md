@@ -35,10 +35,3 @@ cd cal-annas
 zip Anna\'s\ Archive.zip __init__.py annas_archive.py config.py constants.py plugin-import-name-store_annas_archive.txt
 calibre-customize -a "Anna's Archive.zip"
 ```
-
----
-
-## Credits
-
-- Original plugin by [ScottBot10](https://github.com/ScottBot10/calibre_annas_archive)
-- [Anna's Archive](https://annas-archive.gl) — the world's largest open-source shadow library
