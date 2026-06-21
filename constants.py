@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = (
     'DEFAULT_MIRRORS', 'MIRRORS_DISCOVERY_URL', 'MAX_PAGES_DEFAULT', 'DEFAULT_TIMEOUT',
+    'RESULTS_PER_PAGE',
     'TTLCache', 'SearchOption', 'SearchConfiguration', 'CheckboxConfiguration',
     'Order', 'Content', 'Access', 'FileType', 'Source', 'Language',
 )
@@ -39,7 +40,7 @@ DEFAULT_MIRRORS = [
 # Discovery URL intentionally removed: annas-archive.org is no longer active.
 # Mirror list must be maintained manually or via the plugin config UI.
 MIRRORS_DISCOVERY_URL = ''
-RESULTS_PER_PAGE = 100
+RESULTS_PER_PAGE = 18   # Anna's Archive returns ~18 results per search page
 
 # ---------------------------------------------------------------------------
 # Tuneable defaults (exposed in ConfigWidget)
@@ -179,6 +180,7 @@ Order = SearchOption('Order', 'order', 'sort', SearchConfiguration, (
     (_('Smallest'), 'smallest'),
     (_('Newest (open sourced)'), 'newest_added'),
     (_('Oldest (open sourced)'), 'oldest_added'),
+    (_('Random'), 'random'),
 ))
 
 Content = SearchOption('Content', 'content', 'content', CheckboxConfiguration, (
